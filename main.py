@@ -45,9 +45,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from agent_window import AgentWindow, endpoint_from_profile
+
 APP_NAME = "llama-launcher"
 CREATE_NO_WINDOW = 0x08000000
-PROFILES_SCHEMA = 3
+PROFILES_SCHEMA = 4
 
 # Powers-of-2 defaults + common llama.cpp sizes from your profiles
 CTX_PRESETS: tuple[str, ...] = tuple(
@@ -70,6 +72,19 @@ CTX_PRESETS: tuple[str, ...] = tuple(
 FLASH_ATTN_PRESETS = ("on", "off", "auto")
 REASONING_PRESETS = ("off", "on", "auto")
 FIT_PRESETS = ("on", "off")
+# llama.cpp speculative decoding types (MTP = draft-mtp)
+SPEC_TYPE_PRESETS = (
+    "draft-mtp",
+    "none",
+    "draft-simple",
+    "draft-eagle3",
+    "draft-dflash",
+    "ngram-cache",
+    "ngram-simple",
+    "ngram-map-k",
+    "ngram-map-k4v",
+    "ngram-mod",
+)
 TOOL_PRESETS = (
     "all",
     "read_file,file_glob_search,grep_search,get_datetime",
@@ -123,6 +138,12 @@ KNOBS: tuple[Knob, ...] = (
     Knob("Runtime", "use_chat_template_kwargs", "chat_template_kwargs", "--chat-template-kwargs", "value", '{"enable_thinking":true}', (), (), "--chat-template-kwargs"),
     Knob("Runtime", "use_chat_template", "chat_template", "--chat-template", "value", "", (), (), "--chat-template"),
     Knob("Runtime", "use_chat_template_file", "chat_template_file", "--chat-template-file", "value", "", (), (), "--chat-template-file"),
+    # --- Speculative / MTP (requires an MTP-capable GGUF) ---
+    Knob("MTP", "use_spec_type", "spec_type", "--spec-type", "combo", "draft-mtp", SPEC_TYPE_PRESETS, (), "--spec-type (draft-mtp = MTP)"),
+    Knob("MTP", "use_spec_draft_n_max", "spec_draft_n_max", "--spec-draft-n-max", "value", "3", (), (), "--spec-draft-n-max"),
+    Knob("MTP", "use_spec_draft_n_min", "spec_draft_n_min", "--spec-draft-n-min", "value", "0", (), (), "--spec-draft-n-min"),
+    Knob("MTP", "use_spec_draft_p_min", "spec_draft_p_min", "--spec-draft-p-min", "value", "0.0", (), ("--draft-p-min",), "--spec-draft-p-min"),
+    Knob("MTP", "use_spec_default", "spec_default", "--spec-default", "bool", "", (), (), "--spec-default"),
     # --- Reasoning ---
     Knob("Reasoning", "use_reasoning", "reasoning", "--reasoning", "combo", "off", REASONING_PRESETS, ("-rea",), "--reasoning"),
     Knob("Reasoning", "use_reasoning_budget", "reasoning_budget", "--reasoning-budget", "value", "0", (), (), "--reasoning-budget"),
@@ -159,8 +180,8 @@ for _knob in KNOBS:
     for _alias in _knob.aliases:
         RAW_FLAG_MAP[_alias] = _knob
 
-LLAMA_CPP_SERVER = Path(r"D:\llama.cpp\build\bin\llama-server.exe")
-TURBOQUANT_SERVER = Path(r"D:\llama-cpp-turboquant\build\bin\llama-server.exe")
+LLAMA_CPP_SERVER = Path(r"E:\builds\llama.cpp\bin\llama-server.exe")
+TURBOQUANT_SERVER = Path(r"E:\builds\llama-cpp-turboquant\bin\llama-server.exe")
 AI_STUFF = Path(r"D:\AI stuff")
 SLOTS_DIR = Path(r"D:\slots")
 GEMMA4_CHAT_TEMPLATE = Path(r"D:\llama.cpp\models\templates\google-gemma-4-31B-it.jinja")
@@ -189,6 +210,10 @@ def load_settings() -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "hf_token": "",
         "download_dir": str(AI_STUFF),
+        "obsidian_vault": "",
+        "agent_workspace": "",
+        "agent_max_steps": 20,
+        "agent_temperature": 0.2,
     }
     if not path.is_file():
         return defaults
@@ -203,14 +228,40 @@ def load_settings() -> dict[str, Any]:
         out["hf_token"] = data["hf_token"]
     if isinstance(data.get("download_dir"), str) and data["download_dir"].strip():
         out["download_dir"] = data["download_dir"].strip()
+    if isinstance(data.get("obsidian_vault"), str):
+        out["obsidian_vault"] = data["obsidian_vault"].strip()
+    if isinstance(data.get("agent_workspace"), str):
+        out["agent_workspace"] = data["agent_workspace"].strip()
+    try:
+        steps = int(data.get("agent_max_steps", defaults["agent_max_steps"]))
+        out["agent_max_steps"] = max(1, min(100, steps))
+    except (TypeError, ValueError):
+        pass
+    try:
+        temp = float(data.get("agent_temperature", defaults["agent_temperature"]))
+        out["agent_temperature"] = max(0.0, min(2.0, temp))
+    except (TypeError, ValueError):
+        pass
     return out
 
 
 def save_settings(settings: dict[str, Any]) -> None:
     path = settings_path()
+    try:
+        steps = int(settings.get("agent_max_steps") or 20)
+    except (TypeError, ValueError):
+        steps = 20
+    try:
+        temp = float(settings.get("agent_temperature") if settings.get("agent_temperature") is not None else 0.2)
+    except (TypeError, ValueError):
+        temp = 0.2
     payload = {
         "hf_token": str(settings.get("hf_token") or ""),
         "download_dir": str(settings.get("download_dir") or AI_STUFF),
+        "obsidian_vault": str(settings.get("obsidian_vault") or "").strip(),
+        "agent_workspace": str(settings.get("agent_workspace") or "").strip(),
+        "agent_max_steps": max(1, min(100, steps)),
+        "agent_temperature": max(0.0, min(2.0, temp)),
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -951,7 +1002,7 @@ def default_seed_profiles() -> list[dict[str, Any]]:
             "binary": tq,
             "model": m("Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"),
             "ngl": "999",
-            "threads": "8",
+            "threads": "3",
             "ctx_size": "262144",
             "host": "0.0.0.0",
             "port": "11434",
@@ -962,6 +1013,63 @@ def default_seed_profiles() -> list[dict[str, Any]]:
             "mlock": True,
             "use_n_cpu_moe": True,
             "n_cpu_moe": "35",
+            "use_threads_batch": True,
+            "threads_batch": "8",
+            "use_batch": True,
+            "batch": "512",
+            "use_ubatch": True,
+            "ubatch": "512",
+            "use_cache_reuse": True,
+            "cache_reuse": "256",
+            "use_np": True,
+            "np": "1",
+            "use_chat_template_kwargs": True,
+            "chat_template_kwargs": '{"enable_thinking":true}',
+            "use_reasoning": True,
+            "reasoning": "auto",
+            "raw_args": "",
+            "_flags_promoted": True,
+        },
+        {
+            "name": "Qwen 3.6 28B REAP prune (~18t/s)",
+            "binary": tq,
+            "model": m("Qwen3.6-28B-REAP20-A3B-Q4_K_M.gguf"),
+            "ngl": "99",
+            "threads": "3",
+            "ctx_size": "64000",
+            "host": "0.0.0.0",
+            "port": "11434",
+            "cache_type_k": "turbo4",
+            "cache_type_v": "turbo3",
+            "jinja": True,
+            "no_mmap": True,
+            "mlock": True,
+            "use_ot": True,
+            "ot": r"blk\.(0|1|2|3|4|5)\.ffn_.*_exps=CUDA0,ffn_.*_exps=CPU",
+            "use_batch": True,
+            "batch": "2048",
+            "use_ubatch": True,
+            "ubatch": "1024",
+            "use_threads_batch": True,
+            "threads_batch": "8",
+            "use_fit": True,
+            "fit": "off",
+            "use_temp": True,
+            "temp": "0.7",
+            "use_top_p": True,
+            "top_p": "0.95",
+            "use_top_k": True,
+            "top_k": "20",
+            "use_min_p": True,
+            "min_p": "0.0",
+            "use_presence_penalty": True,
+            "presence_penalty": "0.0",
+            "use_repeat_penalty": True,
+            "repeat_penalty": "1.0",
+            "use_cache_reuse": True,
+            "cache_reuse": "256",
+            "use_np": True,
+            "np": "1",
             "raw_args": "",
             "_flags_promoted": True,
         },
@@ -2019,10 +2127,10 @@ class HuggingFaceWindow(QDialog):
         return self.token_edit.text().strip()
 
     def _save_prefs(self) -> None:
-        self._settings = {
-            "hf_token": self._token(),
-            "download_dir": self.dest_edit.text().strip() or str(AI_STUFF),
-        }
+        merged = load_settings()
+        merged["hf_token"] = self._token()
+        merged["download_dir"] = self.dest_edit.text().strip() or str(AI_STUFF)
+        self._settings = merged
         save_settings(self._settings)
         self.status.setText("Preferences saved.")
 
@@ -2480,6 +2588,7 @@ class MainWindow(QMainWindow):
         self._resource_timer.timeout.connect(self._refresh_resources)
 
         self._hf_window: HuggingFaceWindow | None = None
+        self._agent_window: AgentWindow | None = None
         self._bench_windows: list[BenchmarkWindow] = []
 
         self._build_ui()
@@ -2490,6 +2599,7 @@ class MainWindow(QMainWindow):
         self._update_running_ui(False)
         self._resource_timer.start()
         self._refresh_resources()
+        self._sync_agent_endpoint()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -2526,6 +2636,10 @@ class MainWindow(QMainWindow):
         self.btn_hf = QPushButton("Hugging Face…")
         self.btn_hf.clicked.connect(self._open_hf_window)
         left_layout.addWidget(self.btn_hf)
+
+        self.btn_agent = QPushButton("Agent…")
+        self.btn_agent.clicked.connect(self._open_agent_window)
+        left_layout.addWidget(self.btn_agent)
 
         splitter.addWidget(left)
 
@@ -2813,6 +2927,8 @@ class MainWindow(QMainWindow):
         self.ctv_edit.textChanged.connect(self._refresh_kv_forecast)
         self.ctx_edit.currentTextChanged.connect(self._refresh_kv_forecast)
         self.ctx_edit.editTextChanged.connect(self._refresh_kv_forecast)
+        self.host_edit.textChanged.connect(self._sync_agent_endpoint)
+        self.port_edit.textChanged.connect(self._sync_agent_endpoint)
         if "use_np" in self.knob_widgets:
             chk, edit = self.knob_widgets["use_np"]
             chk.toggled.connect(self._refresh_kv_forecast)
@@ -2821,6 +2937,11 @@ class MainWindow(QMainWindow):
         if "use_swa_full" in self.knob_widgets:
             chk, _edit = self.knob_widgets["use_swa_full"]
             chk.toggled.connect(self._refresh_kv_forecast)
+        if "use_api_key" in self.knob_widgets:
+            chk, edit = self.knob_widgets["use_api_key"]
+            chk.toggled.connect(self._sync_agent_endpoint)
+            if isinstance(edit, QLineEdit):
+                edit.textChanged.connect(self._sync_agent_endpoint)
         self._refresh_kv_forecast()
 
     # --- profile list ---
@@ -2897,6 +3018,7 @@ class MainWindow(QMainWindow):
         self.raw_edit.setPlainText(profile.get("raw_args", ""))
         self._loading = False
         self._refresh_preview()
+        self._sync_agent_endpoint()
 
     def _form_as_profile(self, profile_id: str) -> dict[str, Any]:
         existing = self._find_profile(profile_id) or new_profile()
@@ -3013,6 +3135,8 @@ class MainWindow(QMainWindow):
         tools = self.menuBar().addMenu("&Tools")
         act_hf = tools.addAction("Hugging Face Search & Download…")
         act_hf.triggered.connect(self._open_hf_window)
+        act_agent = tools.addAction("Agent…")
+        act_agent.triggered.connect(self._open_agent_window)
 
     def _open_hf_window(self) -> None:
         if self._hf_window is None:
@@ -3021,6 +3145,31 @@ class MainWindow(QMainWindow):
         self._hf_window.show()
         self._hf_window.raise_()
         self._hf_window.activateWindow()
+
+    def _open_agent_window(self) -> None:
+        if self._agent_window is None:
+            self._agent_window = AgentWindow(
+                self,
+                load_settings_fn=load_settings,
+                save_settings_fn=save_settings,
+            )
+        self._sync_agent_endpoint()
+        self._agent_window.show()
+        self._agent_window.raise_()
+        self._agent_window.activateWindow()
+
+    def _sync_agent_endpoint(self) -> None:
+        if self._agent_window is None:
+            return
+        profile = self._current_form_profile()
+        host, port, api_key = endpoint_from_profile(profile)
+        self._agent_window.set_endpoint(
+            host=host,
+            port=port,
+            api_key=api_key,
+            server_running=self.runner.running,
+            profile_name=str(profile.get("name") or ""),
+        )
 
     def _open_benchmark(self) -> None:
         if self._current_id:
@@ -3407,10 +3556,12 @@ class MainWindow(QMainWindow):
     def _on_server_started(self, pid: int) -> None:
         self._update_running_ui(True, pid)
         self._log_line(f"[launcher] Running PID {pid}")
+        self._sync_agent_endpoint()
 
     def _on_server_finished(self, exit_code: int) -> None:
         self._log_line(f"[launcher] Process exited with code {exit_code}")
         self._update_running_ui(False)
+        self._sync_agent_endpoint()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._current_id:
@@ -3421,6 +3572,8 @@ class MainWindow(QMainWindow):
             if win.runner.running:
                 win._stop_bench()
             win.close()
+        if self._agent_window is not None:
+            self._agent_window.close()
         super().closeEvent(event)
 
 

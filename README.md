@@ -12,6 +12,7 @@ Profiles are stored at:
 - **Python 3.10+** (3.11+ recommended)
 - A built **llama-server** binary from [llama.cpp](https://github.com/ggerganov/llama.cpp) (or your fork)
 - Optional: CUDA / GPU drivers if you use GPU offload
+- Optional: [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg` on PATH) for faster Agent grep / vault search
 
 ## Fresh clone setup
 
@@ -57,6 +58,20 @@ python main.py
 
 Default seed profiles may point at machine-specific paths — update them to match your install.
 
+## Agent (Python tool harness)
+
+Open **Tools → Agent…** (or the sidebar **Agent…** button) while a server is running. The Agent window talks to your profile’s OpenAI-compatible endpoint (`/v1/chat/completions`) and runs a local tool loop:
+
+- Files: `read_file`, `write_file`, `edit_file`, `file_glob_search`, `grep_search`
+- Shell: `exec_shell_command` (cwd = workspace; not fully sandboxed)
+- Web: `web_search` (via `ddgs`)
+- Obsidian memory: `memory_list`, `memory_read`, `memory_write`, `memory_search`
+- Misc: `get_datetime`
+
+Configure the **Obsidian vault** path and **workspace** in the Agent window (saved under `%APPDATA%\llama_launcher\settings.json`). File/memory tools stay inside those roots; shell can still reach elsewhere via commands.
+
+This harness does **not** require llama-server `--tools` / `--agent` (those knobs remain for the built-in Web UI). It also does **not** send OpenAI `tools` in API requests (that triggers llama-server’s peg-native parser and can cause HTTP 500 errors); tools are executed in Python from `<tool_call>` blocks in the model’s text output.
+
 ## Dependencies
 
 | Package           | Purpose                          |
@@ -64,6 +79,7 @@ Default seed profiles may point at machine-specific paths — update them to mat
 | PyQt6             | Desktop UI                       |
 | psutil            | Process / system helpers         |
 | huggingface_hub   | Optional model search & download |
+| ddgs              | Agent web search                 |
 
 ## Notes
 
